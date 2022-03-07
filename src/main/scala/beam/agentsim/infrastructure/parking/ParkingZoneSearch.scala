@@ -1,6 +1,8 @@
 package beam.agentsim.infrastructure.parking
 
 import beam.agentsim.agents.choice.logit.MultinomialLogit
+import beam.agentsim.agents.vehicles.VehicleManager
+import beam.agentsim.agents.vehicles.VehicleManager.ReservedFor
 import beam.agentsim.infrastructure.ParkingStall
 import beam.agentsim.infrastructure.charging._
 import beam.agentsim.infrastructure.taz.TAZ
@@ -64,9 +66,11 @@ object ParkingZoneSearch {
     parkingDuration: Double,
     parkingMNLConfig: ParkingMNL.ParkingMNLConfig,
     zoneSearchTree: ZoneSearchTree[GEO],
-    parkingZones: Map[Id[ParkingZoneId], ParkingZone[GEO]],
+    aggregatedParkingZones: Map[Id[ParkingZoneId], ParkingZone[GEO]],
+    aggregatedToAllZones: Map[Id[ParkingZoneId], Array[ParkingZone[GEO]]],
     zoneQuadTree: QuadTree[GEO],
     random: Random,
+    reservedFor: ReservedFor,
     parkingTypes: Seq[ParkingType] = ParkingType.AllTypes
   )
 
@@ -106,8 +110,8 @@ object ParkingZoneSearch {
   /**
     * used within a search to track search data
     *
-    * @param parkingAlternative
-    * @param utilityParameters
+    * @param parkingAlternative ParkingAlternative
+    * @param utilityParameters Map[ParkingMNL.Parameters, Double]
     */
   private[ParkingZoneSearch] case class ParkingSearchAlternative[GEO](
     parkingAlternative: ParkingAlternative[GEO],
@@ -161,19 +165,33 @@ object ParkingZoneSearch {
             parkingType         <- params.parkingTypes
             parkingZoneIds      <- parkingTypesSubtree.get(parkingType).toList
             parkingZoneId       <- parkingZoneIds
-            parkingZone         <- ParkingZone.getParkingZone(params.parkingZones, parkingZoneId)
+            parkingZone         <- ParkingZone.getParkingZone(params.aggregatedParkingZones, parkingZoneId)
             if parkingZoneFilterFunction(parkingZone)
           } yield {
-            // wrap ParkingZone in a ParkingAlternative
-            val stallLocation: Coord = parkingZoneLocSamplingFunction(parkingZone)
+
             val stallPriceInDollars: Double =
               parkingZone.pricingModel match {
                 case None => 0
                 case Some(pricingModel) =>
                   PricingModel.evaluateParkingTicket(pricingModel, params.parkingDuration.toInt)
               }
+
+            // wrap "original" ParkingZones in a ParkingAlternative
+            // as the aggregated ParkingZones serve as higher level of abstraction to speed up the search
+            val Some((originalZone, stallLocation, _)) = params
+              .aggregatedToAllZones(parkingZone.parkingZoneId)
+              .foldLeft[Option[(ParkingZone[GEO], Location, Double)]](None) { case (acc, z) =>
+                val stallLocation: Coord = parkingZoneLocSamplingFunction(parkingZone)
+                val distance: Double = config.distanceFunction(params.destinationUTM, stallLocation)
+                val validManagerType =
+                  z.reservedFor.managerType == VehicleManager.TypeEnum.Default || z.reservedFor == params.reservedFor
+                if (z.stallsAvailable > 0 && validManagerType && (acc.isEmpty || acc.exists(_._3 > distance)))
+                  Some((z, stallLocation, distance))
+                else acc
+              }
+
             val parkingAlternative: ParkingAlternative[GEO] =
-              ParkingAlternative(zone, parkingZone.parkingType, parkingZone, stallLocation, stallPriceInDollars)
+              ParkingAlternative(zone, originalZone.parkingType, originalZone, stallLocation, stallPriceInDollars)
             val parkingAlternativeUtility: Map[ParkingMNL.Parameters, Double] =
               parkingZoneMNLParamsFunction(parkingAlternative)
             ParkingSearchAlternative(

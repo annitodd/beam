@@ -74,15 +74,11 @@ class ParkingFunctions[GEO: GeoLevel](
 
     val homeActivityPrefersResidentialFactor: Double = if (goingHome) 1.0 else 0.0
 
-    val params: Map[ParkingMNL.Parameters, Double] = new Map.Map4(
-      key1 = ParkingMNL.Parameters.RangeAnxietyCost,
-      value1 = 0.0,
-      key2 = ParkingMNL.Parameters.WalkingEgressCost,
-      value2 = distanceFactor,
-      key3 = ParkingMNL.Parameters.ParkingTicketCost,
-      value3 = parkingCostsPriceFactor,
-      key4 = ParkingMNL.Parameters.HomeActivityPrefersResidentialParking,
-      value4 = homeActivityPrefersResidentialFactor
+    val params: Map[ParkingMNL.Parameters, Double] = Map(
+      ParkingMNL.Parameters.RangeAnxietyCost                      -> 0.0,
+      ParkingMNL.Parameters.WalkingEgressCost                     -> distanceFactor,
+      ParkingMNL.Parameters.ParkingTicketCost                     -> parkingCostsPriceFactor,
+      ParkingMNL.Parameters.HomeActivityPrefersResidentialParking -> homeActivityPrefersResidentialFactor
     )
 
     params
@@ -180,21 +176,25 @@ class ParkingFunctions[GEO: GeoLevel](
     inquiry: ParkingInquiry,
     preferredParkingTypes: Set[ParkingType]
   ): Boolean = {
-    val hasAvailability: Boolean = parkingZones(zone.parkingZoneId).stallsAvailable > 0
+    val originalZones = aggregatedZonesToAllZones(zone.parkingZoneId).map(parkingZones)
 
-    val validParkingType: Boolean = preferredParkingTypes.contains(zone.parkingType)
-
-    val isValidTime = inquiry.beamVehicle.forall(vehicle =>
-      zone.timeRestrictions
-        .get(vehicle.beamVehicleType.vehicleCategory)
-        .forall(_.contains(inquiry.destinationUtm.time % (24 * 3600)))
-    )
-
-    val isValidVehicleManager = inquiry.beamVehicle.forall { vehicle =>
-      zone.reservedFor.managerType == VehicleManager.TypeEnum.Default || zone.reservedFor.managerId == vehicle.vehicleManagerId.get
+    val isValidVehicleManager = zone.reservedFor.managerType match {
+      case VehicleManager.TypeEnum.Default   => !inquiry.beamVehicle.exists(_.isCAV)
+      case VehicleManager.TypeEnum.NoManager => false
+      case _                                 => originalZones.exists(_.reservedFor == inquiry.reservedFor)
     }
 
-    hasAvailability & validParkingType & isValidTime & isValidVehicleManager
+    val isValidParkingType: Boolean = preferredParkingTypes.contains(zone.parkingType)
+
+    val hasAvailability = originalZones.exists { z =>
+      z.stallsAvailable > 0 && inquiry.beamVehicle.forall(vehicle =>
+        z.timeRestrictions
+          .get(vehicle.beamVehicleType.vehicleCategory)
+          .forall(_.contains(inquiry.destinationUtm.time % (24 * 3600)))
+      )
+    }
+
+    hasAvailability & isValidParkingType & isValidVehicleManager
   }
 
   /**
