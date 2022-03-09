@@ -1,7 +1,7 @@
 package beam.agentsim.infrastructure
 
 import beam.agentsim.agents.vehicles.{BeamVehicle, VehicleManager}
-import beam.agentsim.infrastructure.ParkingInquiry.ParkingSearchMode
+import beam.agentsim.infrastructure.ParkingInquiry.{ParkingActivityType, ParkingSearchMode}
 import beam.agentsim.infrastructure.charging.ChargingPointType
 import beam.agentsim.infrastructure.parking.ParkingZoneSearch.{ParkingAlternative, ParkingZoneSearchResult}
 import beam.agentsim.infrastructure.parking._
@@ -53,11 +53,13 @@ class ChargingFunctions[GEO: GeoLevel](
   }
 
   def ifOvernightStayThenSlowChargingOnly(zone: ParkingZone[GEO], inquiry: ParkingInquiry): Boolean = {
-    inquiry.searchMode match {
-      case ParkingSearchMode.Init => !ChargingPointType.isFastCharger(zone.chargingPointType.get)
-      case _ =>
-        true // it is fine to park at any charger
-    }
+    if (
+      inquiry.searchMode == ParkingSearchMode.Init || List(ParkingActivityType.Home, ParkingActivityType.Work).contains(
+        inquiry.parkingActivityType
+      )
+    ) {
+      !ChargingPointType.isFastCharger(zone.chargingPointType.get)
+    } else true
   }
 
   /**
