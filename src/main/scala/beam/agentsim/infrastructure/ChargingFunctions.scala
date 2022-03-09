@@ -1,6 +1,7 @@
 package beam.agentsim.infrastructure
 
 import beam.agentsim.agents.vehicles.{BeamVehicle, VehicleManager}
+import beam.agentsim.infrastructure.ParkingInquiry.ParkingSearchMode
 import beam.agentsim.infrastructure.charging.ChargingPointType
 import beam.agentsim.infrastructure.parking.ParkingZoneSearch.{ParkingAlternative, ParkingZoneSearchResult}
 import beam.agentsim.infrastructure.parking._
@@ -51,6 +52,14 @@ class ChargingFunctions[GEO: GeoLevel](
     }
   }
 
+  def ifOvernightStayThenSlowChargingOnly(zone: ParkingZone[GEO], inquiry: ParkingInquiry): Boolean = {
+    inquiry.searchMode match {
+      case ParkingSearchMode.Init => !ChargingPointType.isFastCharger(zone.chargingPointType.get)
+      case _ =>
+        true // it is fine to park at any charger
+    }
+  }
+
   /**
     * Method that verifies if the vehicle has valid charging capability
     * @param zone ParkingZone
@@ -84,6 +93,8 @@ class ChargingFunctions[GEO: GeoLevel](
 
     val rideHailFastChargingOnly: Boolean = ifRideHailCurrentlyOnShiftThenFastChargingOnly(zone, inquiry)
 
+    val overnightStaySlowChargingOnly: Boolean = ifOvernightStayThenSlowChargingOnly(zone, inquiry)
+
     val validChargingCapability: Boolean = hasValidChargingCapability(zone, inquiry.beamVehicle)
 
     val preferredParkingTypes = getPreferredParkingTypes(inquiry)
@@ -111,7 +122,7 @@ class ChargingFunctions[GEO: GeoLevel](
     }
 
     val canCarParkHere: Boolean = hasAvailability & validParkingType & isValidTime & isValidVehicleManager
-    isEV && rideHailFastChargingOnly && validChargingCapability && canCarParkHere
+    isEV && rideHailFastChargingOnly && validChargingCapability && canCarParkHere && overnightStaySlowChargingOnly
   }
 
   /**
