@@ -139,10 +139,10 @@ trait GeoUtils extends ExponentialLazyLogging {
     maxRadius: Double,
     streetMode: StreetMode = StreetMode.WALK
   ): Split = {
-    notExponentialLogger.info("Called _getR5Split with {}, {}, {}", streetMode, maxRadius, coord)
     val isWithinBbox = streetLayer.envelope.contains(coord.getX, coord.getY)
     var theSplit: Split = null
     if (isWithinBbox) {
+      notExponentialLogger.info("calling getR5Split with mode {} radius {} x {} y {}", streetMode, maxRadius, coord.getX, coord.getY)
       theSplit = streetLayer.findSplit(coord.getY, coord.getX, maxRadius, streetMode)
       if (theSplit == null) {
         notExponentialLogger.warn(
