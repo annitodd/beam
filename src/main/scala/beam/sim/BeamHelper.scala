@@ -31,6 +31,7 @@ import beam.sim.modules.{BeamAgentModule, UtilsModule}
 import beam.sim.population.PopulationScaling
 import beam.sim.termination.TerminationCriterionProvider
 import beam.utils.BeamVehicleUtils.{readBeamVehicleTypeFile, readFuelTypeFile, readVehiclesFile}
+import beam.utils.SnapCoordinateUtils._
 import beam.utils._
 import beam.utils.csv.readers
 import beam.utils.plan.sampling.AvailableModeUtils
@@ -51,7 +52,7 @@ import com.typesafe.scalalogging.LazyLogging
 import kamon.Kamon
 import org.matsim.api.core.v01.network.Link
 import org.matsim.api.core.v01.population._
-import org.matsim.api.core.v01.{Coord, Id, Scenario}
+import org.matsim.api.core.v01.{Id, Scenario}
 import org.matsim.core.api.experimental.events.EventsManager
 import org.matsim.core.config.groups.TravelTimeCalculatorConfigGroup
 import org.matsim.core.config.{Config => MatsimConfig}
@@ -77,8 +78,6 @@ import scala.sys.process.Process
 import scala.util.{Random, Try}
 
 trait BeamHelper extends LazyLogging {
-  import BeamHelper.SnapCoordinateResult
-  import BeamHelper.SnapCoordinateResult._
   //  Kamon.init()
 
   private val originalConfigLocationPath = "originalConfigLocation"
@@ -271,7 +270,7 @@ trait BeamHelper extends LazyLogging {
     )
   }
 
-  def loadScenario(beamConfig: BeamConfig): BeamScenario = {
+  def loadScenario(beamConfig: BeamConfig, outputDir: String): BeamScenario = {
     val vehicleTypes = maybeScaleTransit(beamConfig, readBeamVehicleTypeFile(beamConfig))
     val vehicleCsvReader = new VehicleCsvReader(beamConfig)
     val baseFilePath = Paths.get(beamConfig.beam.agentsim.agents.vehicles.vehicleTypesFilePath).getParent
@@ -302,7 +301,7 @@ trait BeamHelper extends LazyLogging {
     val linkToTAZMapping: Map[Link, TAZ] = LinkLevelOperations.getLinkToTazMapping(networkCoordinator.network, tazMap)
 
     val (freightCarriers, fixedActivitiesDurationsFromFreight) =
-      readFreights(beamConfig, networkCoordinator.transportNetwork.streetLayer, vehicleTypes)
+      readFreights(beamConfig, networkCoordinator.transportNetwork.streetLayer, vehicleTypes, outputDir)
 
     val fixedActivitiesDurationsFromConfig: Map[String, Double] = {
       val maybeFixedDurationsList = beamConfig.beam.agentsim.agents.activities.activityTypeToFixedDurationMap
@@ -346,13 +345,14 @@ trait BeamHelper extends LazyLogging {
   def readFreights(
     beamConfig: BeamConfig,
     streetLayer: StreetLayer,
-    vehicleTypes: Map[Id[BeamVehicleType], BeamVehicleType]
+    vehicleTypes: Map[Id[BeamVehicleType], BeamVehicleType],
+    outputDir: String
   ): (IndexedSeq[FreightCarrier], Map[String, Double]) = {
     val freightConfig = beamConfig.beam.agentsim.agents.freight
 
     if (freightConfig.enabled) {
       val geoUtils = new GeoUtilsImpl(beamConfig)
-      val freightReader = FreightReader(beamConfig, geoUtils, streetLayer)
+      val freightReader = FreightReader(beamConfig, geoUtils, streetLayer, outputDir)
       val tours = freightReader.readFreightTours()
       val plans = freightReader.readPayloadPlans()
       val carriers = freightReader.readFreightCarriers(tours, plans, vehicleTypes)
@@ -723,7 +723,8 @@ trait BeamHelper extends LazyLogging {
         beamServices.beamConfig,
         beamServices.geo,
         beamServices.beamScenario.transportNetwork.streetLayer,
-        beamServices.beamScenario.tazTreeMap
+        beamServices.beamScenario.tazTreeMap,
+        outputDir
       )
       generatePopulationForPayloadPlans(
         beamScenario,
@@ -809,10 +810,12 @@ trait BeamHelper extends LazyLogging {
 
     val geoUtils = new GeoUtilsImpl(beamConfig)
 
+    val outputDir = matsimConfig.controler().getOutputDirectory
+
     val (scenario, beamScenario, plansMerged) =
       ProfilingUtils.timed(s"Load scenario using $src/$fileFormat", x => logger.info(x)) {
         if (src == "urbansim" || src == "urbansim_v2" || src == "generic") {
-          val beamScenario = loadScenario(beamConfig)
+          val beamScenario = loadScenario(beamConfig, outputDir)
           val emptyScenario = ScenarioBuilder(matsimConfig, beamScenario.network).build
           val (scenario, plansMerged) = {
             val source = src match {
@@ -880,7 +883,7 @@ trait BeamHelper extends LazyLogging {
         } else if (src == "beam") {
           fileFormat match {
             case "csv" =>
-              val beamScenario = loadScenario(beamConfig)
+              val beamScenario = loadScenario(beamConfig, outputDir)
               val scenario = {
                 val source = new BeamScenarioSource(
                   beamConfig,
@@ -892,7 +895,7 @@ trait BeamHelper extends LazyLogging {
               }.asInstanceOf[MutableScenario]
               (scenario, beamScenario, false)
             case "xml" =>
-              val beamScenario = loadScenario(beamConfig)
+              val beamScenario = loadScenario(beamConfig, outputDir)
               val scenario = {
                 val result = ScenarioUtils.loadScenario(matsimConfig).asInstanceOf[MutableScenario]
                 fixDanglingPersons(result)
@@ -907,13 +910,12 @@ trait BeamHelper extends LazyLogging {
         }
       }
 
-    val linkRadiusMeters = beamConfig.beam.routing.r5.linkRadiusMeters
+    val r5LinkRadiusMeters = beamConfig.beam.routing.r5.linkRadiusMeters
     val validatedScenario =
       validateScenario(
         scenario,
-        beamScenario.transportNetwork.streetLayer,
-        geoUtils,
-        linkRadiusMeters
+        SnapLocationHelper(geoUtils, beamScenario.transportNetwork.streetLayer, r5LinkRadiusMeters),
+        matsimConfig.controler().getOutputDirectory
       )
     (validatedScenario, beamScenario, plansMerged)
   }
@@ -922,20 +924,20 @@ trait BeamHelper extends LazyLogging {
     * 1. remove people/households if location is either out of bounding box or split returns null
     * 2. update plan locations to split locations
     *
-    * @param scenario       mutable scenario
-    * @param streetLayer    network street layer
-    * @param geo            geo util for location conversions
-    * @param maxRadius      r5 split radius
+    * @param scenario           mutable scenario
+    * @param snapLocationHelper snap coordinate store
     * @return
     */
   private def validateScenario(
     scenario: MutableScenario,
-    streetLayer: StreetLayer,
-    geo: GeoUtils,
-    maxRadius: Double
+    snapLocationHelper: SnapLocationHelper,
+    outputDir: String
   ): MutableScenario = {
 
-    def logScenarioInfo(msg: String): Unit = {
+    def logScenarioInfo(msg: String, removedCountOpt: Option[Int] = None): Unit = {
+      if (removedCountOpt.nonEmpty) {
+        logger.info("Total person removed: {}", removedCountOpt.get)
+      }
       logger.info(
         "{}  | households size: {} | population size: {}",
         msg,
@@ -945,23 +947,6 @@ trait BeamHelper extends LazyLogging {
     }
 
     logScenarioInfo("BEFORE VALIDATING SCENARIO")
-
-    val mappedLocations: TrieMap[Coord, Option[Coord]] = TrieMap.empty
-
-    // TODO rrp do you want to move it our of BeamHelper trait?
-    def computeSnapCoordResult(personId: Id[Person], utmCoord: Coord): SnapCoordinateResult = {
-      val wgsCoord = geo.utm2Wgs(utmCoord)
-      if (streetLayer.envelope.contains(wgsCoord.getX, wgsCoord.getY)) {
-        val snapCoordOpt = mappedLocations.getOrElseUpdate(
-          utmCoord,
-          Option(geo.getR5Split(streetLayer, wgsCoord, maxRadius)).map { split =>
-            val updatedPlanCoord = geo.splitToCoord(split)
-            geo.wgs2Utm(updatedPlanCoord)
-          }
-        )
-        snapCoordOpt.fold[SnapCoordinateResult](SplitNullError(personId, utmCoord))(_ => Success)
-      } else OutOfBoundingBoxError(personId, utmCoord)
-    }
 
     def createHouseholdWithGivenMembers(
       household: Household,
@@ -974,26 +959,30 @@ trait BeamHelper extends LazyLogging {
       householdResult
     }
 
+    val errors: ListBuffer[SnapLocationErrorInfo] = ListBuffer()
+
     val removePeople: Set[Id[Person]] = scenario.getPopulation.getPersons.asScala.flatMap { case (id, person) =>
       val planElements = person.getPlans.asScala.flatMap(_.getPlanElements.asScala)
 
       val snapCoordResults = planElements.map {
-        case e: Activity => computeSnapCoordResult(id, e.getCoord)
-        case _: Leg      => Success
+        case e: Activity => snapLocationHelper.computeResult(id, e.getCoord)
+        case _: Leg      => Succeed
       }
 
-      val keepPerson = snapCoordResults.forall(_ == Success)
-      val removalReason = snapCoordResults.find(_ != Success)
+      val keepPerson = snapCoordResults.forall(_ == Succeed)
+      val removalReasons = snapCoordResults.filterNot(_ == Succeed)
 
       if (keepPerson) None
       else {
-        removalReason match {
-          case Some(OutOfBoundingBoxError(id, planCoord)) =>
-            logger.warn("PERSON REMOVAL REASON: out of bounding box. {person: {}, coord: {}}", id, planCoord)
-          case Some(SplitNullError(id, planCoord)) =>
-            logger.warn("PERSON REMOVAL REASON: split is null. {person: {}, coord: {}}", id, planCoord)
-          case e =>
-            logger.error("PERSON REMOVAL REASON: this shouldn't be happening. {}", e)
+        removalReasons.foreach {
+          case OutOfBoundingBoxError(id, planCoord) =>
+            errors.append(SnapLocationErrorInfo(id.toString, ErrorOutOfBoundingBox, planCoord.getX, planCoord.getY))
+            logger.warn("REMOVING PERSON: location is out of bounding box. {person: {}, coord: {}}", id, planCoord)
+          case R5SplitNullError(id, planCoord) =>
+            errors.append(SnapLocationErrorInfo(id.toString, ErrorR5SplitNull, planCoord.getX, planCoord.getY))
+            logger.warn("REMOVING PERSON: location split is null. {person: {}, coord: {}}", id, planCoord)
+          case Succeed =>
+            logger.error("REMOVING PERSON: this shouldn't be happening.")
         }
         Some(id)
       }
@@ -1026,10 +1015,10 @@ trait BeamHelper extends LazyLogging {
     val allPeople = scenario.getPopulation.getPersons.keySet().asScala
     allPeople.diff(removePeople).foreach { personId =>
       val person = scenario.getPopulation.getPersons.get(personId)
-      person.getPlans.asScala.zipWithIndex.foreach { case (plan, idx) =>
-        plan.getPlanElements.get(idx) match {
+      person.getPlans.asScala.foreach { plan =>
+        plan.getPlanElements.asScala.foreach {
           case elem: Activity =>
-            mappedLocations(elem.getCoord) match {
+            snapLocationHelper.store(elem.getCoord) match {
               case Some(coord) =>
                 elem.setCoord(coord)
               case None =>
@@ -1045,7 +1034,13 @@ trait BeamHelper extends LazyLogging {
       }
     }
 
-    logScenarioInfo("AFTER VALIDATING SCENARIO")
+    logScenarioInfo("AFTER VALIDATING SCENARIO", Some(errors.groupBy(_.id).keys.size))
+
+    SnapCoordinateUtils.writeToCsv(
+      errors.toList,
+      path = s"$outputDir/planSnapLocationError.csv",
+      idColumn = "personId"
+    )
 
     scenario
   }
@@ -1169,7 +1164,7 @@ trait BeamHelper extends LazyLogging {
     result
   }
 
-  def run(beamServices: BeamServices) {
+  def run(beamServices: BeamServices): Unit = {
     beamServices.controler.run()
   }
 
@@ -1199,15 +1194,3 @@ trait BeamHelper extends LazyLogging {
 }
 
 case class MapStringDouble(data: Map[String, Double])
-
-object BeamHelper {
-
-  trait SnapCoordinateResult
-
-  object SnapCoordinateResult {
-    final case class OutOfBoundingBoxError(personId: Id[Person], coord: Coord) extends SnapCoordinateResult
-    final case class SplitNullError(personId: Id[Person], coord: Coord) extends SnapCoordinateResult
-    final case object Success extends SnapCoordinateResult
-  }
-
-}

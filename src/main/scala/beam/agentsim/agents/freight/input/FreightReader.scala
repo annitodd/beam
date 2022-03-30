@@ -12,6 +12,7 @@ import beam.sim.BeamServices
 import beam.sim.common.GeoUtils
 import beam.sim.config.BeamConfig
 import beam.sim.config.BeamConfig.Beam.Agentsim.Agents.Freight
+import beam.utils.SnapCoordinateUtils.SnapLocationHelper
 import com.conveyal.r5.streets.StreetLayer
 import org.matsim.api.core.v01.population._
 import org.matsim.api.core.v01.{Coord, Id}
@@ -185,7 +186,8 @@ object FreightReader {
     beamConfig: BeamConfig,
     geoUtils: GeoUtils,
     streetLayer: StreetLayer,
-    tazMap: TAZTreeMap
+    tazMap: TAZTreeMap,
+    outputDir: String
   ): FreightReader = {
     val rand: Random = new Random(beamConfig.matsim.modules.global.randomSeed)
     val config = beamConfig.beam.agentsim.agents.freight
@@ -196,16 +198,17 @@ object FreightReader {
           geoUtils,
           rand,
           tazMap,
-          Some(ClosestUTMPointOnMap(streetLayer, beamConfig.beam.routing.r5.linkRadiusMeters))
+          Some(SnapLocationHelper(geoUtils, streetLayer, beamConfig.beam.routing.r5.linkRadiusMeters)),
+          outputDir
         )
       case s =>
         throw new RuntimeException(s"Unknown freight reader $s")
     }
   }
 
-  def apply(beamConfig: BeamConfig, geoUtils: GeoUtils, streetLayer: StreetLayer): FreightReader = {
+  def apply(beamConfig: BeamConfig, geoUtils: GeoUtils, streetLayer: StreetLayer, outputDir: String): FreightReader = {
     val tazMap = TAZTreeMap.getTazTreeMap(beamConfig.beam.agentsim.taz.filePath)
-    apply(beamConfig, geoUtils, streetLayer, tazMap)
+    apply(beamConfig, geoUtils, streetLayer, tazMap, outputDir)
   }
 
   def apply(beamServices: BeamServices): FreightReader =
@@ -213,21 +216,7 @@ object FreightReader {
       beamServices.beamConfig,
       beamServices.geo,
       beamServices.beamScenario.transportNetwork.streetLayer,
-      beamServices.beamScenario.tazTreeMap
+      beamServices.beamScenario.tazTreeMap,
+      beamServices.matsimServices.getControlerIO.getOutputPath
     )
-
-  case class ClosestUTMPointOnMap(streetLayer: StreetLayer, r5LinkRadiusMeters: Double) {
-
-    def find(wsgCoord: Coord, geoUtils: GeoUtils): Option[Coord] = {
-      //val wsgCoord = geoUtils.utm2Wgs(utmCoord)
-      val theSplit = geoUtils.getR5Split(streetLayer, wsgCoord, r5LinkRadiusMeters)
-      if (theSplit == null) {
-        None
-      } else {
-        val wgsPointOnMap = geoUtils.splitToCoord(theSplit)
-        val utmCoord = geoUtils.wgs2Utm(wgsPointOnMap)
-        Some(utmCoord)
-      }
-    }
-  }
 }

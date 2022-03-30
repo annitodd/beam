@@ -1,19 +1,21 @@
 package beam.agentsim.agents.freight.input
 
 import beam.agentsim.agents.freight._
-import beam.agentsim.agents.freight.input.FreightReader.ClosestUTMPointOnMap
 import beam.agentsim.agents.vehicles.{BeamVehicle, BeamVehicleType}
 import beam.agentsim.infrastructure.taz.{TAZ, TAZTreeMap}
 import beam.sim.common.GeoUtils
 import beam.sim.config.BeamConfig.Beam.Agentsim.Agents.Freight
+import beam.utils.SnapCoordinateUtils
+import beam.utils.SnapCoordinateUtils._
 import beam.utils.csv.GenericCsvReader
 import beam.utils.matsim_conversion.MatsimPlanConversion.IdOps
 import com.typesafe.scalalogging.LazyLogging
+import org.apache.commons.lang3.StringUtils.isBlank
 import org.matsim.api.core.v01.population._
 import org.matsim.api.core.v01.{Coord, Id}
 import org.matsim.households.Household
-import org.apache.commons.lang3.StringUtils.isBlank
 
+import scala.collection.mutable.ListBuffer
 import scala.util.Random
 
 /**
@@ -24,7 +26,8 @@ class GenericFreightReader(
   val geoUtils: GeoUtils,
   rnd: Random,
   tazTree: TAZTreeMap,
-  closestUTMPointOnMapMaybe: Option[ClosestUTMPointOnMap]
+  snapLocationHelperMaybe: Option[SnapLocationHelper],
+  outputDir: String
 ) extends LazyLogging
     with FreightReader {
 
@@ -40,6 +43,7 @@ class GenericFreightReader(
 
   @Override
   def readFreightTours(): Map[Id[FreightTour], FreightTour] = {
+    val errors: ListBuffer[SnapLocationErrorInfo] = ListBuffer()
     val maybeTours = GenericCsvReader
       .readAsSeq[Option[FreightTour]](config.toursFilePath) { row =>
         def get(key: String): String = getRowValue(config.toursFilePath, row, key)
@@ -47,26 +51,64 @@ class GenericFreightReader(
         val tourId: Id[FreightTour] = get("tourId").createId[FreightTour]
         val departureTimeInSec = get("departureTimeInSec").toInt
         val maxTourDurationInSec = get("maxTourDurationInSec").toInt
+        val departureLocationX = row.get("departureLocationX")
+        val departureLocationY = row.get("departureLocationY")
+
+        // note: placeholder to update warehouseLocationTaz and warehouseLocationUTM later
+        val freightTour = FreightTour(
+          tourId,
+          departureTimeInSec,
+          None,
+          new Coord(),
+          maxTourDurationInSec
+        )
+
         extractCoordOrTaz(
-          row.get("departureLocationX"),
-          row.get("departureLocationY"),
+          tourId,
+          departureLocationX,
+          departureLocationY,
           row.get("departureLocationZone")
         ) match {
-          case (departureLocationZoneMaybe, Some(departureLocationUTMOnMap)) =>
+          case (departureLocationZoneMaybe, Left(departureLocationUTMOnMap)) =>
             Some(
-              FreightTour(
-                tourId,
-                departureTimeInSec,
-                departureLocationZoneMaybe,
-                departureLocationUTMOnMap,
-                maxTourDurationInSec
+              freightTour.copy(
+                warehouseLocationTaz = departureLocationZoneMaybe,
+                warehouseLocationUTM = departureLocationUTMOnMap
               )
             )
+          case (departureLocationZoneMaybe, Right(Succeed)) =>
+            val departureLocationUTMOnMap =
+              getSnappedLocation(location(departureLocationX.toDouble, departureLocationY.toDouble))
+            Some(
+              freightTour.copy(
+                warehouseLocationTaz = departureLocationZoneMaybe,
+                warehouseLocationUTM = departureLocationUTMOnMap
+              )
+            )
+          case (_, Right(OutOfBoundingBoxError(_, planCoord))) =>
+            errors.append(
+              SnapLocationErrorInfo(tourId.toString, ErrorOutOfBoundingBox, planCoord.getX, planCoord.getY)
+            )
+            logger.warn(
+              "Following freight tour row discarded because departure location is out of bounding box: {}",
+              row
+            )
+            None
+          case (_, Right(R5SplitNullError(_, planCoord))) =>
+            errors.append(SnapLocationErrorInfo(tourId.toString, ErrorR5SplitNull, planCoord.getX, planCoord.getY))
+            logger.warn("Following freight tour row discarded because departure location is not reachable: {}", row)
+            None
           case _ =>
-            logger.error(f"Following freight tour row discarded because departure location is not reachable: $row")
+            logger.error("Following freight tour row is discarded: {}", row)
             None
         }
       }
+
+    SnapCoordinateUtils.writeToCsv(
+      errors.toList,
+      path = s"$outputDir/freightTourSnapLocationError.csv",
+      idColumn = "tourId"
+    )
 
     maybeTours.flatten
       .groupBy(_.tourId)
@@ -75,6 +117,7 @@ class GenericFreightReader(
 
   @Override
   def readPayloadPlans(): Map[Id[PayloadPlan], PayloadPlan] = {
+    val errors: ListBuffer[SnapLocationErrorInfo] = ListBuffer()
     val maybePlans = GenericCsvReader
       .readAsSeq[Option[PayloadPlan]](config.plansFilePath) { row =>
         def get(key: String): String = getRowValue(config.plansFilePath, row, key)
@@ -94,30 +137,54 @@ class GenericFreightReader(
         } else {
           requestType.toString
         }
-        extractCoordOrTaz(row.get("locationX"), row.get("locationY"), row.get("locationZone")) match {
-          case (locationZoneMaybe, Some(locationUTMOnMap)) =>
-            Some(
-              PayloadPlan(
-                get("payloadId").createId,
-                get("sequenceRank").toDouble.round.toInt,
-                get("tourId").createId,
-                get("payloadType").createId[PayloadType],
-                get("weightInKg").toDouble,
-                requestType,
-                activityType,
-                locationZoneMaybe,
-                locationUTMOnMap,
-                get("estimatedTimeOfArrivalInSec").toDouble.toInt,
-                get("arrivalTimeWindowInSecLower").toDouble.toInt,
-                get("arrivalTimeWindowInSecUpper").toDouble.toInt,
-                operationDurationInSec
-              )
+        val payloadId = get("payloadId").createId[PayloadPlan]
+        val locationX = row.get("locationX")
+        val locationY = row.get("locationY")
+
+        // note: placeholder to update locationZone and locationUTM later
+        val payloadPlan = PayloadPlan(
+          payloadId,
+          get("sequenceRank").toDouble.round.toInt,
+          get("tourId").createId,
+          get("payloadType").createId[PayloadType],
+          get("weightInKg").toDouble,
+          requestType,
+          activityType,
+          None,
+          new Coord(),
+          get("estimatedTimeOfArrivalInSec").toDouble.toInt,
+          get("arrivalTimeWindowInSecLower").toDouble.toInt,
+          get("arrivalTimeWindowInSecUpper").toDouble.toInt,
+          operationDurationInSec
+        )
+
+        extractCoordOrTaz(payloadId, locationX, locationY, row.get("locationZone")) match {
+          case (locationZoneMaybe, Left(locationUTMOnMap)) =>
+            Some(payloadPlan.copy(locationZone = locationZoneMaybe, locationUTM = locationUTMOnMap))
+          case (locationZoneMaybe, Right(Succeed)) =>
+            val locationUTMOnMap = getSnappedLocation(location(locationX.toDouble, locationY.toDouble))
+            Some(payloadPlan.copy(locationZone = locationZoneMaybe, locationUTM = locationUTMOnMap))
+          case (_, Right(OutOfBoundingBoxError(_, planCoord))) =>
+            errors.append(
+              SnapLocationErrorInfo(payloadId.toString, ErrorOutOfBoundingBox, planCoord.getX, planCoord.getY)
             )
+            logger.warn("Following freight plan row discarded because location is out of bounding box: {}", row)
+            None
+          case (_, Right(R5SplitNullError(_, planCoord))) =>
+            errors.append(SnapLocationErrorInfo(payloadId.toString, ErrorR5SplitNull, planCoord.getX, planCoord.getY))
+            logger.warn("Following freight plan row discarded because location is not reachable: {}", row)
+            None
           case _ =>
-            logger.error(f"Following freight plan row discarded because zone location is not reachable: $row")
+            logger.error("Following freight plan row is discarded: {}", row)
             None
         }
       }
+
+    SnapCoordinateUtils.writeToCsv(
+      errors.toList,
+      path = s"$outputDir/freightPayloadSnapLocationError.csv",
+      idColumn = "payloadId"
+    )
 
     maybePlans.flatten
       .groupBy(_.payloadId)
@@ -130,7 +197,7 @@ class GenericFreightReader(
     allPlans: Map[Id[PayloadPlan], PayloadPlan],
     vehicleTypes: Map[Id[BeamVehicleType], BeamVehicleType]
   ): IndexedSeq[FreightCarrier] = {
-
+    val errors: ListBuffer[SnapLocationErrorInfo] = ListBuffer()
     val existingTours: Set[Id[FreightTour]] = allTours.keySet.intersect(allPlans.map(_._2.tourId).toSet)
     val plans: Map[Id[PayloadPlan], PayloadPlan] = allPlans.filter { case (_, plan) =>
       existingTours.contains(plan.tourId)
@@ -205,16 +272,40 @@ class GenericFreightReader(
       val vehicleId: Id[BeamVehicle] = Id.createVehicleId(s"$freightIdPrefix-vehicle-${get("vehicleId")}")
       val vehicleTypeId: Id[BeamVehicleType] = get("vehicleTypeId").createId
       if (!existingTours.contains(tourId)) {
-        logger.error(f"Following freight carrier row discarded because tour $tourId was filtered out: $row")
+        logger.error("Following freight carrier row discarded because tour {} was filtered out: {}", tourId, row)
         None
       } else {
-        extractCoordOrTaz(row.get("warehouseX"), row.get("warehouseY"), row.get("warehouseZone")) match {
-          case (warehouseZoneMaybe, Some(warehouseUTMOnMap)) =>
-            Some(FreightCarrierRow(carrierId, tourId, vehicleId, vehicleTypeId, warehouseZoneMaybe, warehouseUTMOnMap))
-          case (_, warehouseXYMaybe) =>
-            logger.error(
-              f"Following freight carrier row discarded because warehouse location ($warehouseXYMaybe) is not reachable: $row"
+        val warehouseX = row.get("warehouseX")
+        val warehouseY = row.get("warehouseY")
+
+        // note: placeholder to update warehouseLocationZone and warehouseLocationUTM later
+        val freightCarrier = FreightCarrierRow(carrierId, tourId, vehicleId, vehicleTypeId, None, new Coord())
+
+        extractCoordOrTaz(carrierId, warehouseX, warehouseY, row.get("warehouseZone")) match {
+          case (warehouseZoneMaybe, Left(warehouseUTMOnMap)) =>
+            Some(
+              freightCarrier.copy(warehouseLocationZone = warehouseZoneMaybe, warehouseLocationUTM = warehouseUTMOnMap)
             )
+          case (warehouseZoneMaybe, Right(Succeed)) =>
+            val warehouseUTMOnMap = getSnappedLocation(location(warehouseX.toDouble, warehouseY.toDouble))
+            Some(
+              freightCarrier.copy(warehouseLocationZone = warehouseZoneMaybe, warehouseLocationUTM = warehouseUTMOnMap)
+            )
+          case (_, Right(OutOfBoundingBoxError(_, planCoord))) =>
+            errors.append(
+              SnapLocationErrorInfo(carrierId.toString, ErrorOutOfBoundingBox, planCoord.getX, planCoord.getY)
+            )
+            logger.warn(
+              "Following freight carrier row discarded because warehouse location is out of bounding box: {}",
+              row
+            )
+            None
+          case (_, Right(R5SplitNullError(_, planCoord))) =>
+            errors.append(SnapLocationErrorInfo(carrierId.toString, ErrorR5SplitNull, planCoord.getX, planCoord.getY))
+            logger.warn("Following freight carrier row discarded because warehouse location is not reachable: {}", row)
+            None
+          case _ =>
+            logger.error("Following freight carrier row is discarded: {}", row)
             None
         }
       }
@@ -227,8 +318,19 @@ class GenericFreightReader(
       }
       .toIndexedSeq
 
+    SnapCoordinateUtils.writeToCsv(
+      errors.toList,
+      path = s"$outputDir/freightCarrierSnapLocationError.csv",
+      idColumn = "carrierId"
+    )
+
     carriersWithFleet
   }
+
+  private def getSnappedLocation(coord: Coord): Coord =
+    snapLocationHelperMaybe.get
+      .store(coord)
+      .get
 
   private def getTaz(tazId: String): TAZ = tazTree.getTAZ(tazId) match {
     case Some(taz) => taz
@@ -238,16 +340,24 @@ class GenericFreightReader(
   private def getDistributedTazLocation(taz: TAZ): Coord =
     convertedLocation(TAZTreeMap.randomLocationInTAZ(taz, rnd))
 
-  private def getLocationFromCoord(location: Coord): Option[Coord] = {
-    closestUTMPointOnMapMaybe.map(_.find(location, geoUtils)).getOrElse(Some(geoUtils.wgs2Utm(location)))
+  private def computeLocationResult[A](id: Id[A], wgsCoord: Coord): Result = {
+    snapLocationHelperMaybe.map(_.computeResult(id, wgsCoord)).getOrElse(Succeed)
   }
 
-  private def extractCoordOrTaz(strX: String, strY: String, strZone: String): (Option[Id[TAZ]], Option[Coord]) = {
+  // either[tazLocation, snapLocationResult]
+  type ClosestUTMPoint = Either[Coord, Result]
+
+  private def extractCoordOrTaz[A](
+    id: Id[A],
+    strX: String,
+    strY: String,
+    strZone: String
+  ): (Option[Id[TAZ]], ClosestUTMPoint) = {
     if (isBlank(strX) || isBlank(strY)) {
       val taz = getTaz(strZone)
-      (Some(taz.tazId), Some(getDistributedTazLocation(taz)))
+      (Some(taz.tazId), Left(getDistributedTazLocation(taz)))
     } else {
-      (None, getLocationFromCoord(location(strX.toDouble, strY.toDouble)))
+      (None, Right(computeLocationResult(id, location(strX.toDouble, strY.toDouble))))
     }
   }
 
